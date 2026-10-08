@@ -1,12 +1,13 @@
 # Training Framework Notes
 
-训练框架源码与特性分析笔记，记录 MindSpeed-MM、ms-swift、VeOmni 等项目的参数配置、调用流程、通信与数据布局，以及当前实现的支持范围。
+训练框架源码与特性分析笔记，记录 MindSpeed-MM、Megatron、ms-swift、VeOmni 等项目的参数配置、调用流程、通信与数据布局，以及当前实现的支持范围。
 
 ## 内容索引
 
 | 框架 / 主题 | 内容 | 状态 |
 | --- | --- | --- |
 | [MindSpeed-MM](mindspeed-mm/README.md) | [模块异构并行：以 Qwen2.5-VL 为例](mindspeed-mm/heterogeneous-parallelism.md) | 已完成源码静态分析，未运行分布式验证 |
+| [Megatron](megatron/README.md) | [共卡异构并行：从 TP/DP 布局转换到梯度同步](megatron/colocated-heterogeneous-parallelism.md) | 已完成源码静态分析，未运行 GPU 分布式验证 |
 | [ms-swift](ms-swift/README.md) | 后续补充特性分析 | 待分析 |
 | [VeOmni](veomni/README.md) | 后续补充特性分析 | 待分析 |
 | [跨框架对比](comparisons/README.md) | 相同特性在不同框架中的实现与限制 | 待补充 |
@@ -19,6 +20,9 @@ training-framework-notes/
 ├── mindspeed-mm/
 │   ├── README.md
 │   └── heterogeneous-parallelism.md
+├── megatron/
+│   ├── README.md
+│   └── colocated-heterogeneous-parallelism.md
 ├── ms-swift/
 │   └── README.md
 ├── veomni/
