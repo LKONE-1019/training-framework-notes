@@ -2,7 +2,7 @@
 
 异步激活卸载把暂时不需要的激活从设备搬到 CPU，释放设备存储，并在反向或重计算需要这些数据时恢复。它通过拷贝流和计算流之间的事件依赖控制先后顺序，并尝试提前取回下一层将使用的张量，使数据搬运与计算重叠。
 
-本文围绕插件式 FSDP2 的 legacy 异步激活卸载机制逐步展开，目前介绍单张量搬运组件 `SwapTensor` 和按层管理组件 `OffloadManager`。配置入口及 `saved_tensors_hooks` 的完整接入过程暂不展开。
+本文分析插件式 FSDP2 的 legacy 异步激活卸载机制，介绍单张量搬运组件 `SwapTensor`、按层管理组件 `OffloadManager`，并通过 `async_save_on_cpu` 串联配置接入、前向保存、跨层释放、反向恢复与预取。
 
 | 项目 | 范围 |
 | --- | --- |
@@ -14,7 +14,7 @@
 | 并行范围 | 进程内设备与 CPU 之间的搬运，不执行跨 rank 通信；本文不验证特定 DP/TP/CP/PP 组合 |
 | 验证方式 | 本地源码静态分析，未运行设备拷贝、训练或数值对齐实验 |
 
-分析时本文引用的主源文件、设备工具、单例工具和 Flash Attention 调用文件没有未提交修改。源码链接固定到上述提交，路径及行号已按本地文件核对，未验证远端页面可访问性。PyTorch 与 torch_npu 的 storage、事件及分配器底层实现未在本文中检查。
+分析时本文引用的主源文件、特性接入文件、参数定义、设备工具、单例工具和 Flash Attention 调用文件没有未提交修改。源码链接固定到上述提交，路径及行号已按本地文件核对，未验证远端页面可访问性。PyTorch 与 torch_npu 的 storage、事件及分配器底层实现未在本文中检查。
 
 ## 1. 组件分工
 
@@ -169,6 +169,153 @@ clear(key) → 删除管理器的登记关系
 
 这些限制应在扩展调度、接入不同算子或修改流配置时单独核实。本文没有执行训练、内存压力或数值一致性验证。
 
+## 4. 激活卸载的完整流程
+
+普通模块接入路径由 `saved_tensors_hooks` 串起前向保存与反向读取：前向保存符合条件的激活时提交 D2H，后续层触发设备 storage 释放，反向读取时提交 H2D，并尝试提前取回更早一层的激活。本章解释 `async_offload.py` 的 legacy 路径；`impl="stash"` 会走 `ActStash`，其普通激活保存由共享 swap cache 管理，不套用本章调度。
+
+```text
+配置选中模块 → 包装 forward → 进入 saved_tensors_hooks 上下文
+                                   ↓
+                 autograd 保存反向所需张量 → pack 筛选
+                                   ↓
+               非最后一层：SwapTensor 提交 D2H 并登记
+                                   ↓
+            后续层首次符合条件的保存 → 释放上一层 storage
+                                   ↓
+            反向读取保存对象 → unpack 恢复 storage 并提交 H2D
+                                   ↓
+        计算流等待 H2D 事件 → 清理登记、提交前一层预取 → 返回 Tensor
+```
+
+### 4.1 配置与模块接入
+
+参数见 [`FeatureArguments.enable_activation_offload`][offload-enable] 和 [`ActivationOffloadPlanConfig`][offload-plan]：
+
+| 配置项 | 默认值 | 生效作用 |
+| --- | --- | --- |
+| `enable_activation_offload` | `False` | 是否应用激活卸载包装 |
+| `activation_offload_plan.apply_modules` | `None` | 选择要包装的模块；未配置时入口直接返回 |
+| `activation_offload_plan.impl` | `"legacy"` | 选择 legacy 或 stash 实现 |
+
+[`FeaturesApplier.apply_activation_offload_modules()`][offload-entry] 检查开关和模块配置后，在 legacy 分支调用 `get_offload_modules()`，再调用 `async_offload_modules()`。
+
+[`get_offload_modules()`][offload-modules] 根据模块路径匹配目标。带 `{*}` 的路径会定位对应的可迭代层容器并遍历；其他路径通过 `named_modules()` 与 `module_name_match()` 匹配。返回项包含模块名称、模块对象、卸载层编号和总层数。
+
+`layer_idx` 按匹配列表顺序编号，`depth` 最终统一为匹配模块总数；它们不是必然与模型原始层号、总深度相同。后续跨层释放和预取依赖这些编号与实际执行顺序相符。
+
+[`async_offload_modules()`][offload-wrap] 替换目标模块的 `forward`：
+
+```python
+module.forward = with_async_save_on_cpu(name, layer_idx, depth)(module.forward)
+```
+
+### 4.2 forward 包装与保存钩子
+
+[`with_async_save_on_cpu()`][offload-context] 默认取第一个位置参数作为 `hidden_states`，构造 `async_save_on_cpu` 上下文，更新 `TrainingContext` 的模型深度和当前层号，然后在该上下文中执行原 `forward`。
+
+```python
+context = async_save_on_cpu(
+    block_idx=layer_idx,
+    depth=depth,
+    custom_check_fn=lambda x: x.data_ptr() == hidden_states.data_ptr(),
+    prefetch=prefetch,
+)
+with context:
+    return forward_func(*args, **kwargs)
+```
+
+[`async_save_on_cpu`][save-hooks] 继承 PyTorch 的 `saved_tensors_hooks`，在构造时注册 `_pack_to_cpu` 和 `_unpack_from_cpu`：
+
+| 参数或钩子 | 作用 |
+| --- | --- |
+| `block_idx` | 当前模块的卸载层编号，用于生成 key 和选择前一层 |
+| `depth` | 匹配模块总数，用于判断最后一层 |
+| `custom_check_fn` | 在基础筛选后追加张量筛选；类本身默认不添加这个条件，模块包装会添加输入指针条件 |
+| `prefetch` | 默认 `True`，控制 unpack 是否调用前一层预取 |
+| `_pack_to_cpu` | autograd 保存反向所需张量时调用，返回原 Tensor 或 `SwapTensor` |
+| `_unpack_from_cpu` | autograd 读取保存对象时调用，返回可用于后续计算的 Tensor |
+
+进入 `forward` 只是安装保存钩子，实际搬运由 autograd 的保存动作触发；它不在模块返回时自动复制所有输出。退出上下文后，已经保存的对象仍可在反向读取时通过对应 unpack 恢复。
+
+默认包装要求输入在 `args[hidden_states_idx]` 中，`hidden_states_idx=0`。若位置参数缺失或没有 `data_ptr()`，就发出警告并直接执行原 `forward`；只通过 `hidden_states=...` 关键字传入时，不会自动从 `kwargs` 获取输入。
+
+### 4.3 前向 pack：筛选、复制与登记
+
+[`_pack_to_cpu()`][pack] 首先执行 [`base_check_fn()`][base-check]，排除 `Parameter`、直接以 `Parameter` 为 `_base` 的 view，以及空 storage 张量；再执行自定义条件。默认模块包装要求保存张量的 `data_ptr()` 与输入 `hidden_states` 相同。
+
+因此，默认接入主要针对被 autograd 保存的模块输入激活，不覆盖所有中间结果。同一输入被多个算子分别保存时，也可能产生多次 pack 和多个 key；计数器没有按张量身份去重。
+
+符合条件后，pack 生成 `block_idx_tensor_idx` 形式的 key，并在需要时先释放上一层 storage（见第 4.4 节）。若当前是最后一个匹配模块，直接返回原 Tensor；否则执行：
+
+```python
+swap_tensor = SwapTensor(tensor, key)
+swap_tensor.launch_d2h(OffloadManager().swap_stream)
+OffloadManager().put(key, swap_tensor)
+return swap_tensor
+```
+
+`SwapTensor` 分配 CPU pinned-memory 缓冲区。`launch_d2h()` 在当前计算流记录 `forward_event`，让拷贝流等待此前计算，然后非阻塞复制到 CPU 并记录 `d2h_event`。autograd 保存 pack 返回的包装对象，管理器也登记它，供跨层释放和预取查询。
+
+提交 D2H 后，原设备 storage 仍然存在，CPU 缓冲区与设备存储会暂时同时占用内存。`stat="host"` 只表示搬运已提交，不能据此读取尚未完成的 CPU 副本。
+
+### 4.4 跨层释放：后续保存动作触发
+
+在更大层号第一次生成符合条件的 key 时，`GetCnt.get_cnt()` 返回 `after_block=True`，pack 调用：
+
+```python
+OffloadManager().del_npu_tensor(f"{block_idx - 1}_")
+```
+
+管理器按 key 前缀遍历上一层登记项，调用 `wait_d2h_finished()`。该方法让当前流等待 `d2h_event`，随后执行 `tensor.storage().resize_(0)`；Tensor 对象、shape 等元信息和 CPU 副本继续保留。
+
+这将数据复制与设备存储释放分成两个时机，为搬运与前向计算重叠提供机会。释放不是独立的层结束 hook：如果后续层没有符合条件的保存，就不会出现这次触发；层号有空洞时，代码也仍只查找 `block_idx - 1`。
+
+最后一层的直接返回发生在跨层释放之后，因此最后一层虽不卸载自身输入，仍能在符合条件的保存时触发倒数第二层 storage 释放。保留最后一层输入是为了避免紧接着反向时又立刻搬回。
+
+`wait_event()` 建立设备流依赖，不是 Python 线程上的 `synchronize()`。storage 释放涉及共享 view 以及分配器对异步使用的处理，运行时前提见第 2.2 节；本文未验证底层跨流释放行为。
+
+### 4.5 反向 unpack：恢复当前对象并预取前一层
+
+[`_unpack_from_cpu()`][unpack] 收到原 Tensor 时直接返回，包括最后一层以及未通过筛选的张量。这个分支不启动预取。
+
+收到 `SwapTensor` 时，unpack 已经持有保存对象，不必先通过管理器 `get()` 查询。执行顺序是：
+
+1. 调用 `launch_h2d()`，让拷贝流等待当前计算流的事件，恢复原 storage 容量，将 CPU 副本写回并记录 `h2d_event`。
+2. 当前计算流等待 `h2d_event`，保证后续反向计算能够读取恢复的数据。
+3. 从 key 解析层号和层内编号，调用 `clear(key)` 删除登记项，更新 `TrainingContext` 当前层号。
+4. 若 `prefetch=True`，调用 `prefetch_get()` 提交前一层的 H2D，最后返回原 `swap_tensor.tensor`。
+
+前向层序为 `0 → 1 → 2` 时，反向通常沿 `2 → 1 → 0` 进行。恢复层 1 当前激活后提前搬回层 0，就有机会让层 0 的 H2D 与层 1 的反向计算重叠。
+
+预取对象继续留在 `items` 中，直到实际 unpack 清理。已经提交 H2D 的对象状态为 `"device"`，再次调用 `launch_h2d()` 会直接返回，但实际消费时计算流仍需等待此前记录的 `h2d_event`。预取并不保证数据已经到达。
+
+普通 hook 路径的 D2H、H2D 共用 `OffloadManager.swap_stream`；它提供一条与计算流独立的搬运流，并非两条独立的 D2H/H2D 流。当前预取按当前层计数构造前一层候选 key，可能遗漏前一层多出的对象，细节见第 3.6 节。
+
+### 4.6 三层模型的数据流示例
+
+以下是调度示例，不是训练实测：总卡数 1，rank 0，DP/TP/CP/PP 均为 1；一次前向与反向处理一个 microbatch，batch size 为 1。三个被包装的 block 按 `0 → 1 → 2` 执行，输入分别为 `x0`、`x1`、`x2`，均假设为独立、连续的 BF16 张量，shape 为 `[1, 4, 4]`。每个输入包含 16 个元素，逻辑数据量为 32 字节，不代表实际分配器占用。
+
+为突出时序，假设每层恰好发生一次通过筛选的输入保存，没有重计算或其他显式算子缓存，并且后续层释放时不再需要上一层输入的设备数据。
+
+| 时机 | autograd 保存对象 | 搬运、设备存储与管理器变化 |
+| --- | --- | --- |
+| 前向 block 0 保存 `x0` | `SwapTensor(x0, "0_0")` | 提交 `x0` D2H，登记 `"0_0"`；设备 storage 尚保留 |
+| 前向 block 1 保存 `x1` | `SwapTensor(x1, "1_0")` | 触发 `x0` storage 缩小到 0；提交 `x1` D2H，登记 `"1_0"` |
+| 前向 block 2 保存 `x2` | 原 Tensor `x2` | 触发 `x1` storage 缩小到 0；`x2` 留在设备，不登记 `"2_0"` |
+| 反向 block 2 读取 `x2` | 直接返回 `x2` | 使用现有设备数据；该分支不预取 `x1` |
+| 反向 block 1 读取 `x1` | 返回恢复后的 `x1` | 按需恢复 `x1`，计算流等待其 H2D 事件，清理 `"1_0"`；提交 `x0` H2D 预取 |
+| 反向 block 0 读取 `x0` | 返回恢复后的 `x0` | 复用已经提交的 H2D，计算流等待其事件，清理 `"0_0"` |
+
+在该示例中，层 1 的首次回搬是按需发生的，层 0 才有机会通过预取隐藏搬运耗时。如果预取尚未完成，层 0 的反向计算仍需等待；实际收益取决于搬运带宽、计算时长和执行调度。
+
+### 4.7 阅读与验证边界
+
+该路径改变反向所需激活的保存方式，并在使用前恢复数据。D2H/H2D 位于 `torch.no_grad()` 中，不为拷贝建立额外求导图；本章没有验证恢复数据的数值一致性、共享 storage 情形或特定模型训练结果。
+
+激活卸载本身不执行跨 rank 梯度同步，也不管理参数分片、参数梯度或优化器状态。显式算子缓存路径可能在重计算阶段调用同一组组件，但其保存和预取触发点不同；第 3.4 节的 Flash Attention 缓存不能直接套用第 4.6 节的普通 hook 时序。
+
+扩展到交错 microbatch、重入前向或不同拷贝流时，应结合第 3.6 节检查编号、登记和预取假设。本文仅覆盖当前源码的模块包装及普通 saved-tensor 调用流程，没有运行训练、性能或设备内存验证。
+
 [swap-tensor]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L67
 [launch-d2h]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L85
 [wait-d2h]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L102
@@ -185,3 +332,11 @@ clear(key) → 删除管理器的登记关系
 [flash-cache]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/ops/flash_attn/skip_recompute_flash_attn.py#L55
 [prefetch]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L212
 [prefetch-keys]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L53
+[offload-entry]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/apply_features.py#L73
+[offload-plan]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/params/feature_args.py#L190
+[offload-enable]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/params/feature_args.py#L256
+[offload-modules]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L291
+[offload-wrap]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L325
+[offload-context]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L331
+[save-hooks]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L228
+[base-check]: https://gitcode.com/Ascend/MindSpeed-MM/blob/dd6297017f4c967d8c32cd9f6cd0ea2c65e370cc/mindspeed_mm/fsdp/features/memory/async_offload.py#L17
