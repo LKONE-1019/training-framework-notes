@@ -48,8 +48,6 @@ features:
 | `recompute_plan.flatten_inputs` | `false` | 非重入模式下，展平参数树后交给 checkpoint |
 | `recompute_plan.op_replay_scopes` | `[]` | 指定算子回放区域与白名单 |
 
-`recompute` 在该版本由允许额外字段的参数对象接收，入口按真值判断。YAML 应写布尔值 `true/false`，不要写字符串 `"false"`。
-
 ### 模块路径与方法路径
 
 路径相对于传给 `recompute_modules()` 的模型根节点，以 `model.named_modules()` 为准。
