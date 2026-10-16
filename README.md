@@ -1,6 +1,6 @@
 # Training Framework Notes
 
-训练框架源码与特性分析笔记，记录 MindSpeed-MM、Megatron、ms-swift、VeOmni 等项目的参数配置、调用流程、通信与数据布局，以及当前实现的支持范围。
+训练框架源码与特性分析笔记，记录 MindSpeed-MM、Megatron、TorchTitan、ms-swift、VeOmni 等项目的参数配置、调用流程、通信与数据布局，以及当前实现的支持范围。
 
 ## 内容索引
 
@@ -11,6 +11,7 @@
 | [MindSpeed-MM](mindspeed-mm/README.md) | [异步激活卸载机制](mindspeed-mm/async_offload.md) | 已覆盖 legacy 组件与普通 saved-tensor 流程，静态源码分析，未运行设备验证 |
 | [MindSpeed-MM](mindspeed-mm/README.md) | [MoE Token 重排：eager 流程与 NPU 融合接口](mindspeed-mm/moe-permute-unpermute.md) | 源码静态分析与 CPU 小规模前向、梯度检查，未运行 NPU 或分布式验证 |
 | [Megatron](megatron/README.md) | [共卡异构并行：从 TP/DP 布局转换到梯度同步](megatron/colocated-heterogeneous-parallelism.md) | 已完成源码静态分析，未运行 GPU 分布式验证 |
+| [TorchTitan](torchtitan/README.md) | [激活重计算：FullAC、SelectiveAC 与接入流程](torchtitan/activation-checkpointing.md) | 源码静态分析，未运行训练或 GPU/NPU 分布式验证 |
 | [ms-swift](ms-swift/README.md) | 后续补充特性分析 | 待分析 |
 | [VeOmni](veomni/README.md) | 后续补充特性分析 | 待分析 |
 | [跨框架对比](comparisons/README.md) | 相同特性在不同框架中的实现与限制 | 待补充 |
@@ -29,6 +30,9 @@ training-framework-notes/
 ├── megatron/
 │   ├── README.md
 │   └── colocated-heterogeneous-parallelism.md
+├── torchtitan/
+│   ├── README.md
+│   └── activation-checkpointing.md
 ├── ms-swift/
 │   └── README.md
 ├── veomni/
